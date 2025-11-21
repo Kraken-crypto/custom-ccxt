@@ -4,7 +4,7 @@
 import bingxRest from '../bingx.js';
 import { BadRequest, NetworkError, NotSupported } from '../base/errors.js';
 import { ArrayCache, ArrayCacheByTimestamp, ArrayCacheBySymbolById } from '../base/ws/Cache.js';
-import type { Int, Market, OHLCV, Str, OrderBook, Order, Trade, Balances, Ticker, Dict } from '../base/types.js';
+import type { Int, Market, OHLCV, Str, OrderBook, Order, Trade, Balances, Ticker, Dict, Strings, Position } from '../base/types.js';
 import Client from '../base/ws/Client.js';
 
 //  ---------------------------------------------------------------------------
@@ -29,6 +29,7 @@ export default class bingx extends bingxRest {
                 'unWatchOrderBook': true,
                 'unWatchTicker': true,
                 'unWatchTrades': true,
+                'watchPositions': true,
             },
             'urls': {
                 'api': {
@@ -1191,6 +1192,84 @@ export default class bingx extends bingxRest {
         return await this.watch (url, messageHash, request, subscriptionHash, subscription);
     }
 
+    /**
+     * @method
+     * @name bingx#watchPositions
+     * @description watch all open positions
+     * @see https://bingx-api.github.io/docs/#/en-us/swapV2/socket/account.html#Account%20balance%20and%20position%20update%20push
+     * @param {string[]} [symbols] list of unified market symbols
+     * @param {int} [since] timestamp in ms of the earliest position to fetch
+     * @param {int} [limit] the maximum number of positions to fetch
+     * @param {object} [params] extra parameters specific to the exchange API endpoint
+     * @returns {object[]} a list of [position structure]{@link https://docs.ccxt.com/en/latest/manual.html#position-structure}
+     */
+    async watchPositions (symbols: Strings = undefined, since: Int = undefined, limit: Int = undefined, params = {}) : Promise<Position[]> {
+        await this.loadMarkets ();
+        await this.authenticate ();
+        symbols = this.marketSymbols (symbols, undefined, true, true, false);
+        let type = undefined;
+        let subType = undefined;
+        [ type, params ] = this.handleMarketTypeAndParams ('watchPositions', undefined, params, 'swap');
+        [ subType, params ] = this.handleSubTypeAndParams ('watchPositions', undefined, params, 'linear');
+        if (type !== 'swap') {
+            throw new NotSupported (this.id + ' watchPositions is only supported for swap markets');
+        }
+        if (subType === 'inverse') {
+            throw new NotSupported (this.id + ' watchPositions is not supported for inverse swap markets yet');
+        }
+        const baseUrl = this.safeString (this.urls['api']['ws'], subType);
+        const url = baseUrl + '?listenKey=' + this.options['listenKey'];
+        const client = this.client (url);
+        // seed/await snapshot if enabled
+        let fetchPositionsSnapshot = undefined;
+        let awaitPositionsSnapshot = undefined;
+        [ fetchPositionsSnapshot, params ] = this.handleOptionAndParams (params, 'watchPositions', 'fetchPositionsSnapshot', true);
+        [ awaitPositionsSnapshot, params ] = this.handleOptionAndParams (params, 'watchPositions', 'awaitPositionsSnapshot', true);
+        if (fetchPositionsSnapshot) {
+            const messageHash = 'swap:fetchPositionsSnapshot';
+            if (!(messageHash in client.futures)) {
+                client.future (messageHash);
+                this.spawn (this.loadPositionsSnapshot, client, messageHash, subType);
+            }
+            if (awaitPositionsSnapshot) {
+                await client.future (messageHash);
+            }
+        } else {
+            if (this.positions === undefined) {
+                this.positions = {};
+            }
+            if (!(subType in this.positions)) {
+                this.positions[subType] = new ArrayCacheBySymbolById ();
+            }
+        }
+        const positionsMessageHash = 'swap:positions';
+        // positions are pushed via ACCOUNT_UPDATE on the swap private channel; no explicit subscribe payload is required.
+        const newPositions = await this.watch (url, positionsMessageHash, undefined, 'swap:private');
+        if (this.newUpdates) {
+            return newPositions;
+        }
+        return this.filterBySymbolsSinceLimit (this.positions[subType], symbols, since, limit, true);
+    }
+
+    async loadPositionsSnapshot (client, messageHash, subType) {
+        const positions = await this.fetchPositions (undefined, { 'type': 'swap', 'subType': subType });
+        if (this.positions === undefined) {
+            this.positions = {};
+        }
+        this.positions[subType] = new ArrayCacheBySymbolById ();
+        const cache = this.positions[subType];
+        for (let i = 0; i < positions.length; i++) {
+            const position = positions[i];
+            const contracts = this.safeNumber (position, 'contracts', 0);
+            if (contracts > 0) {
+                cache.append (position);
+            }
+        }
+        const future = client.futures[messageHash];
+        future.resolve (cache);
+        client.resolve (cache, 'swap:positions');
+    }
+
     setBalanceCache (client: Client, type, subType, subscriptionHash, params) {
         if (subscriptionHash in client.subscriptions) {
             return;
@@ -1544,6 +1623,39 @@ export default class bingx extends bingxRest {
         }
         this.balance[type] = this.safeBalance (this.balance[type]);
         client.resolve (this.balance[type], type + ':balance');
+        // Positions only exist in swap messages
+        const rawPositions = this.safeList (a, 'P', []);
+        if (rawPositions.length > 0) {
+            if (this.positions === undefined) {
+                this.positions = {};
+            }
+            if (!('linear' in this.positions)) {
+                this.positions['linear'] = new ArrayCacheBySymbolById ();
+            }
+            const cached = this.positions['linear'];
+            const newPositions = [];
+            for (let i = 0; i < rawPositions.length; i++) {
+                const p = rawPositions[i];
+                // map ws fields to REST-style fields used by parsePosition
+                const marketId = this.safeString (p, 's');
+                const mapped = {
+                    'symbol': marketId,
+                    'positionAmt': this.safeString (p, 'pa'),
+                    'avgPrice': this.safeString (p, 'ep'),
+                    'unrealizedProfit': this.safeString (p, 'up'),
+                    'isolated': (this.safeStringLower (p, 'mt') === 'isolated'),
+                    'margin': this.safeString (p, 'iw'),
+                    'positionSide': this.safeString (p, 'ps'),
+                    'realisedProfit': this.safeString (p, 'cr'),
+                };
+                const marketType = 'swap';
+                const market = this.safeMarket (marketId, undefined, undefined, marketType);
+                const parsed = this.parsePosition (mapped, market);
+                cached.append (parsed);
+                newPositions.push (parsed);
+            }
+            client.resolve (newPositions, 'swap:positions');
+        }
     }
 
     handleMessage (client: Client, message) {
