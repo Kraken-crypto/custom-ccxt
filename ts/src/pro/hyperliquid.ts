@@ -2,8 +2,8 @@
 
 import hyperliquidRest from '../hyperliquid.js';
 import Client from '../base/ws/Client.js';
-import { Int, Str, Market, OrderBook, Trade, OHLCV, Order, Dict, Strings, Ticker, Tickers, type Num, OrderType, OrderSide, type OrderRequest, Bool } from '../base/types.js';
-import { ArrayCache, ArrayCacheByTimestamp, ArrayCacheBySymbolById } from '../base/ws/Cache.js';
+import { Int, Str, Market, OrderBook, Trade, OHLCV, Order, Dict, Strings, Ticker, Tickers, type Num, OrderType, OrderSide, type OrderRequest, Bool, Position } from '../base/types.js';
+import { ArrayCache, ArrayCacheByTimestamp, ArrayCacheBySymbolById, ArrayCacheBySymbolBySide } from '../base/ws/Cache.js';
 
 //  ---------------------------------------------------------------------------
 
@@ -27,6 +27,7 @@ export default class hyperliquid extends hyperliquidRest {
                 'watchTrades': true,
                 'watchTradesForSymbols': false,
                 'watchPosition': false,
+                'watchPositions': true,
             },
             'urls': {
                 'api': {
@@ -41,6 +42,10 @@ export default class hyperliquid extends hyperliquidRest {
                 },
             },
             'options': {
+                'watchPositions': {
+                    'fetchPositionsSnapshot': true,
+                    'awaitPositionsSnapshot': true,
+                },
             },
             'streaming': {
                 'ping': this.ping,
@@ -53,6 +58,69 @@ export default class hyperliquid extends hyperliquidRest {
                 },
             },
         });
+    }
+
+    /**
+     * @method
+     * @name hyperliquid#watchPositions
+     * @description watch all open positions; seeds from REST once, then updates using userFills (myTrades)
+     * @param {string[]} [symbols] list of unified market symbols
+     * @param {int} [since] the earliest time in ms to fetch positions for
+     * @param {int} [limit] the maximum number of positions to retrieve
+     * @param {object} params extra parameters specific to the exchange API endpoint
+     * @param {string} [params.user] user address, will default to this.walletAddress if not provided
+     * @returns {object[]} a list of [position structure]{@link https://docs.ccxt.com/en/latest/manual.html#position-structure}
+     */
+    async watchPositions (symbols: Strings = undefined, since: Int = undefined, limit: Int = undefined, params = {}) : Promise<Position[]> {
+        await this.loadMarkets ();
+        let userAddress = undefined;
+        [ userAddress, params ] = this.handlePublicAddress ('watchPositions', params);
+        symbols = this.marketSymbols (symbols, undefined, true);
+        const url = this.urls['api']['ws']['public'];
+        const client = this.client (url);
+        // seed snapshot if configured
+        const fetchPositionsSnapshot = this.handleOption ('watchPositions', 'fetchPositionsSnapshot', true);
+        const awaitPositionsSnapshot = this.handleOption ('watchPositions', 'awaitPositionsSnapshot', true);
+        if (fetchPositionsSnapshot && (this.positions === undefined)) {
+            const snapshotMessageHash = 'fetchPositionsSnapshot';
+            if (!(snapshotMessageHash in client.futures)) {
+                client.future (snapshotMessageHash);
+                this.spawn (this.loadPositionsSnapshot, client, snapshotMessageHash, symbols);
+            }
+            if (awaitPositionsSnapshot) {
+                const snapshot = await client.future (snapshotMessageHash);
+                return this.filterBySymbolsSinceLimit (snapshot, symbols, since, limit, true);
+            }
+        }
+        const subscriptionType = 'userFills'; // reuse same subscription as watchMyTrades to avoid duplicate userFills subscriptions
+        const request: Dict = {
+            'method': 'subscribe',
+            'subscription': {
+                'type': subscriptionType,
+                'user': userAddress,
+            },
+        };
+        let messageHash = 'positions';
+        if (!this.isEmpty (symbols)) {
+            messageHash += '::' + symbols.join (',');
+        }
+        const positions = await this.watch (url, messageHash, this.extend (request, params), subscriptionType);
+        if (this.newUpdates) {
+            return positions;
+        }
+        return this.filterBySymbolsSinceLimit (this.positions, symbols, since, limit, true);
+    }
+
+    async loadPositionsSnapshot (client, messageHash, symbols) {
+        const snapshot = await this.fetchPositions (symbols);
+        this.positions = new ArrayCacheBySymbolBySide ();
+        const cache = this.positions;
+        for (let i = 0; i < snapshot.length; i++) {
+            cache.append (snapshot[i]);
+        }
+        const future = client.futures[messageHash];
+        future.resolve (cache);
+        client.resolve (cache, 'positions');
     }
 
     /**
@@ -398,15 +466,16 @@ export default class hyperliquid extends hyperliquidRest {
             messageHash += ':' + symbol;
         }
         const url = this.urls['api']['ws']['public'];
+        const subscriptionType = 'userFills'; // share subscription with other watchMyTrades calls since userFills is not symbol-specific
         const request: Dict = {
             'method': 'subscribe',
             'subscription': {
-                'type': 'userFills',
+                'type': subscriptionType,
                 'user': userAddress,
             },
         };
         const message = this.extend (request, params);
-        const trades = await this.watch (url, messageHash, message, messageHash);
+        const trades = await this.watch (url, messageHash, message, subscriptionType);
         if (this.newUpdates) {
             limit = trades.getLimit (symbol, limit);
         }
@@ -538,12 +607,18 @@ export default class hyperliquid extends hyperliquidRest {
         if (dataLength === 0) {
             return;
         }
+        const newPositions = [];
         for (let i = 0; i < data.length; i++) {
             const rawTrade = data[i];
             const parsed = this.parseWsTrade (rawTrade);
             const symbol = parsed['symbol'];
             symbols[symbol] = true;
             trades.append (parsed);
+            // adjust positions cache based on the trade
+            const updated = this.applyTradeToPositions (parsed);
+            if (updated !== undefined) {
+                newPositions.push (updated);
+            }
         }
         const keys = Object.keys (symbols);
         for (let i = 0; i < keys.length; i++) {
@@ -553,6 +628,116 @@ export default class hyperliquid extends hyperliquidRest {
         // non-symbol specific
         const messageHash = 'myTrades';
         client.resolve (trades, messageHash);
+        // resolve positions delta if any
+        if (newPositions.length > 0) {
+            const positionMessageHashes = this.findMessageHashes (client, 'positions::');
+            for (let i = 0; i < positionMessageHashes.length; i++) {
+                const positionMessageHash = positionMessageHashes[i];
+                const parts = positionMessageHash.split ('::');
+                const symbolsString = this.safeString (parts, 1);
+                if (symbolsString !== undefined) {
+                    const positionSymbols = symbolsString.split (',');
+                    const filteredPositions = this.filterByArray (newPositions, 'symbol', positionSymbols, false);
+                    if (!this.isEmpty (filteredPositions)) {
+                        client.resolve (filteredPositions, positionMessageHash);
+                    }
+                }
+            }
+            client.resolve (newPositions, 'positions');
+        }
+    }
+
+    applyTradeToPositions (trade: Dict) {
+        const symbol = this.safeString (trade, 'symbol');
+        if (symbol === undefined) {
+            return undefined;
+        }
+        if (this.positions === undefined) {
+            this.positions = new ArrayCacheBySymbolBySide ();
+        }
+        const cached = this.positions;
+        const symbolMap = this.safeValue (cached.hashmap, symbol, {});
+        // extract position side from trade's 'dir' field (e.g., "Close Long", "Open Short")
+        const tradeInfo = this.safeDict (trade, 'info', {});
+        const dir = this.safeString (tradeInfo, 'dir', '');
+        let positionSide = undefined;
+        if (dir.indexOf ('Long') >= 0) {
+            positionSide = 'long';
+        } else if (dir.indexOf ('Short') >= 0) {
+            positionSide = 'short';
+        }
+        const price = this.safeNumber (trade, 'price');
+        const amount = this.safeNumber (trade, 'amount');
+        const side = this.safeString (trade, 'side');
+        if ((price === undefined) || (amount === undefined) || (side === undefined)) {
+            return undefined;
+        }
+        // if dir is not available, try to infer from existing positions or trade side (one-way mode)
+        if (positionSide === undefined) {
+            // no existing position - infer from trade side
+            if (side === 'buy') {
+                positionSide = 'long';
+            } else {
+                positionSide = 'short';
+            }
+        }
+        // get the position for the specific side
+        const current = symbolMap[positionSide];
+        // compute signed size: buy increases long, sell increases short
+        // for long: buy = +, sell = -
+        // for short: buy = -, sell = + (opposite)
+        let signedSize = 0;
+        if (positionSide === 'long') {
+            signedSize = (side === 'buy') ? amount : -amount;
+        } else { // short
+            signedSize = (side === 'buy') ? -amount : amount;
+        }
+        const prevContractsRaw = this.safeNumber (current, 'contracts', 0) || 0;
+        const prevEntry = this.safeNumber (current, 'entryPrice');
+        const prevNotional = (prevEntry !== undefined) ? (prevContractsRaw * prevEntry) : 0;
+        const newContractsRaw = prevContractsRaw + signedSize;
+        let newEntry = prevEntry;
+        if (prevContractsRaw === 0) {
+            newEntry = price;
+        } else if (Math.sign (prevContractsRaw) === Math.sign (newContractsRaw)) {
+            // same direction, weighted average
+            const addNotional = Math.abs (signedSize) * price;
+            const totalNotional = prevNotional + addNotional;
+            const totalContracts = Math.abs (prevContractsRaw) + Math.abs (signedSize);
+            newEntry = (totalContracts > 0) ? (totalNotional / totalContracts) : price;
+        } else if (newContractsRaw === 0) {
+            // position closed
+            newEntry = undefined;
+        } else {
+            // flipped direction: reset entry to trade price
+            newEntry = price;
+        }
+        let updated = undefined;
+        if (newContractsRaw === 0) {
+            // position closed - create zero position to notify caller
+            updated = this.safePosition ({
+                'info': current ? current['info'] : {},
+                'symbol': symbol,
+                'contracts': 0,
+                'side': positionSide,
+                'entryPrice': newEntry,
+                'timestamp': this.milliseconds (),
+                'datetime': this.iso8601 (this.milliseconds ()),
+            });
+            cached.append (updated);
+        } else {
+            updated = this.safePosition ({
+                'info': current ? current['info'] : {},
+                'symbol': symbol,
+                'contracts': Math.abs (newContractsRaw),
+                'side': positionSide,
+                'entryPrice': newEntry,
+                'timestamp': this.milliseconds (),
+                'datetime': this.iso8601 (this.milliseconds ()),
+            });
+            cached.append (updated);
+        }
+        return updated;
     }
 
     async watchTrades (symbol: string, since: Int = undefined, limit: Int = undefined, params = {}): Promise<Trade[]> {
