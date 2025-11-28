@@ -1049,6 +1049,7 @@ export default class kucoinfutures extends kucoinfuturesRest {
             return;
         }
         if (deltaEnd !== nonce + 1) {
+            storedOrderBook.cache.push (data);
             const gap = deltaEnd - nonce - 1;
             this.log (this.id + ' orderbook sequence gap detected for ' + symbol + ': expected ' + (nonce + 1) + ', got ' + deltaEnd + ' (gap: ' + gap + '). Resyncing orderbook.');
             const subscriptionArgs = this.safeDict (client.subscriptions, topic, {});
